@@ -1,0 +1,37 @@
+.venv/
+venv/
+env/
+ENV/
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+.env
+.env.*
+!.env.example
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+.vscode/
+.idea/
+
+build/
+dist/
+*.egg-info/
+
+*.log
+
+# Local camera credentials and saved camera choices
+config.py
+cameras.json
+
+# Downloaded model, local footage, and generated counting lines
+yolov8n.pt
+sample.mp4
+counting_line.json*
+lines/*.json

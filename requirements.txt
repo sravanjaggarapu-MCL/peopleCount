@@ -1,0 +1,7 @@
+# Install with:  pip install -r requirements.txt
+#
+# ultralytics pulls in torch and torchvision automatically. The default wheel
+# on Windows is CPU-only, which is what this machine has - for a GPU box,
+# install the CUDA build of torch first from https://pytorch.org, then this.
+ultralytics>=8.3.0
+opencv-python>=4.8.0
