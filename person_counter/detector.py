@@ -56,6 +56,11 @@ class Detection:
     y2: int          # bottom edge
     confidence: float
     track_id: int | None = None   # None in detect mode; an integer in track mode
+    # This person's head (a head_detector.HeadDetection) - filled in by the
+    # optional head stage AFTER tracking and counting have used this frame, so
+    # it can never influence them. None when heads are off or none matched.
+    # Counting keeps using foot_point below; the head is never used for it.
+    head: object | None = None
 
     @property
     def foot_point(self) -> tuple[int, int]:

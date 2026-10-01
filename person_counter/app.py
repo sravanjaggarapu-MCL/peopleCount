@@ -25,6 +25,10 @@ from .detector import PersonDetector
 from .counter import PersonCounter
 from .line_setup import resolve_line
 from . import drawing
+# Optional head feature. Imported here, but only constructed when switched on;
+# see the HeadAssociationStage block in run().
+from . import head_config
+from .head_stage import HeadAssociationStage
 
 
 class FpsMeter:
@@ -73,6 +77,9 @@ class DetectPipeline:
 
     def process(self, frame) -> list[str]:
         detections = self.detector.detect(frame)
+        # Kept for optional add-on stages (head association) that run after
+        # process(). They only set the optional Detection.head field.
+        self.last_detections = detections
         for detection in detections:
             drawing.draw_detection(frame, detection)
 
@@ -108,6 +115,9 @@ class TrackPipeline:
         without inheriting the tracking HUD.
         """
         detections = self.detector.track(frame)
+        # Kept for optional add-on stages (head association) that run after
+        # process(), i.e. after counting. They only set Detection.head.
+        self.last_detections = detections
 
         live_ids = []
         for detection in detections:
@@ -217,13 +227,18 @@ def _build_pipeline(mode: str, stream: VideoStream, show_trails: bool,
 
 def run(mode: str = "count", source: str | None = None, show_trails: bool = True,
         redraw_line: bool = False, line_arg: str | None = None,
-        threaded: bool | None = None) -> int:
+        threaded: bool | None = None, heads: bool | None = None) -> int:
     """Open the source, run the chosen pipeline, display until quit.
+
+    `heads` switches on the optional head detection + person-head association
+    (None = head_config HEAD_DETECTION_ENABLED). It never affects counting.
 
     Returns a process exit code: 0 for a clean finish, 1 if the source failed.
     """
     if threaded is None:
         threaded = config.USE_THREADED_CAPTURE
+    if heads is None:
+        heads = head_config.get("HEAD_DETECTION_ENABLED")
 
     try:
         # open_stream picks the threaded reader for live cameras and the
@@ -234,6 +249,15 @@ def run(mode: str = "count", source: str | None = None, show_trails: bool = True
             pipeline = _build_pipeline(mode, stream, show_trails, redraw_line, line_arg)
             if pipeline is None:
                 return 0     # cancelled during line setup; not an error
+
+            # Optional head stage. Not in view mode, which by design loads no
+            # model. The stage never raises: if its model cannot load it
+            # disables itself and everything below runs exactly as before.
+            head_stage = None
+            if heads and mode != "view":
+                head_stage = HeadAssociationStage()
+                if not head_stage.enabled:
+                    head_stage = None
 
             window_name = f"Person counter - {pipeline.name}"
             # WINDOW_NORMAL makes the window resizable; the default
@@ -251,9 +275,20 @@ def run(mode: str = "count", source: str | None = None, show_trails: bool = True
             fps_meter = FpsMeter()
 
             for frame in stream:
+                # The head model must see the frame BEFORE the pipeline paints
+                # boxes and labels onto it, so take a clean copy first. Only
+                # done when the head stage is active - zero cost otherwise.
+                clean_frame = frame.copy() if head_stage is not None else None
+
                 # The pipeline draws its overlays onto `frame` in place and
                 # hands back whatever it wants shown in the corner.
                 hud_lines = pipeline.process(frame)
+
+                if head_stage is not None:
+                    # Runs strictly AFTER counting has finished for this frame
+                    # and only reads its detections, so it cannot change counts.
+                    hud_lines = hud_lines + head_stage.process(
+                        clean_frame, frame, getattr(pipeline, "last_detections", []))
 
                 fps = fps_meter.tick()
                 # FPS is the honest measure of whether the pipeline keeps up

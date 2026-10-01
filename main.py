@@ -18,6 +18,8 @@ The single entry point for the project. Run this file - nothing else.
     python main.py --dead-zone 20       # widen the ignore band at the line
     python main.py --line 0,300,640,300 # set the line from the command line
     python main.py --no-threaded        # read frames sequentially (debugging)
+    python main.py --heads              # also detect heads and pair them with people
+    python main.py --heads --head-debug # ... and print each ID's person/head boxes
 
 On start-up you are asked which camera to run on, in the format
 
@@ -115,6 +117,27 @@ def parse_args() -> argparse.Namespace:
              f"(default: {config.DEAD_ZONE_PX}). Raise it if a person standing "
              f"on the line makes the counts climb",
     )
+    # Optional head detection + person-head association. Purely additive: it
+    # never changes detection, tracking or counting. Defaults: head_config.py.
+    parser.add_argument(
+        "--heads", action="store_true",
+        help="also detect heads and associate each with its person (optional; "
+             "uses a second model, so expect lower FPS)",
+    )
+    parser.add_argument(
+        "--head-backend", choices=["pose", "yolo"], default=None,
+        help="head source: 'pose' = face keypoints of yolov8n-pose.pt "
+             "(auto-download, default); 'yolo' = your own head-detection model",
+    )
+    parser.add_argument(
+        "--head-model", default=None, metavar="PATH",
+        help="weights for the head backend (default: yolov8n-pose.pt)",
+    )
+    parser.add_argument(
+        "--head-debug", action="store_true",
+        help="with --heads: print each person's ID, person box, head box and "
+             "head point to the console every 10 frames",
+    )
     return parser.parse_args()
 
 
@@ -132,6 +155,14 @@ def main() -> int:
         config.TRACK_CONF_THRESHOLD = args.conf
     if args.dead_zone is not None:
         config.DEAD_ZONE_PX = args.dead_zone
+    # Head-feature overrides, same mechanism: head_config.get() reads config
+    # first, so assigning here reaches every head module.
+    if args.head_backend is not None:
+        config.HEAD_BACKEND = args.head_backend
+    if args.head_model is not None:
+        config.HEAD_MODEL_PATH = args.head_model
+    if args.head_debug:
+        config.HEAD_DEBUG_EVERY_N_FRAMES = 10
 
     # Ask which camera before anything heavy happens. --source or --no-prompt
     # skip the question; a cancelled prompt returns None and we simply stop.
@@ -150,6 +181,8 @@ def main() -> int:
         # False forces sequential reading; None lets open_stream decide per
         # source, which is what you want almost always.
         threaded=False if args.no_threaded else None,
+        # True switches heads on; None defers to HEAD_DETECTION_ENABLED.
+        heads=True if args.heads else None,
     )
 
 

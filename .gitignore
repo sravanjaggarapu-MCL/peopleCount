@@ -35,3 +35,4 @@ yolov8n.pt
 sample.mp4
 counting_line.json*
 lines/*.json
+yolov8n-pose.pt
