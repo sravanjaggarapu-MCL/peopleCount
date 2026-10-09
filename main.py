@@ -15,11 +15,17 @@ The single entry point for the project. Run this file - nothing else.
     python main.py --no-prompt          # skip the question, use config.py
     python main.py --imgsz 320          # faster, slightly less accurate
     python main.py --conf 0.3           # override the confidence threshold
+    python main.py --track-point head   # count by the head, not the feet
     python main.py --dead-zone 20       # widen the ignore band at the line
     python main.py --line 0,300,640,300 # set the line from the command line
     python main.py --no-threaded        # read frames sequentially (debugging)
 
-On start-up you are asked which camera to run on, in the format
+On start-up you are asked two questions: which camera to run on, and which
+point on each person to count by - their feet or their head. --source and
+--track-point answer them in advance, --no-prompt skips both and takes the
+answers from config.py.
+
+The camera is asked for in the format
 
     rtsp://<username>:<password>@<host>:<port>/<stream-path>
 
@@ -44,6 +50,7 @@ import config
 import person_counter
 from person_counter.app import run
 from person_counter.source_prompt import resolve_source, mask
+from person_counter.track_point_prompt import resolve_track_point
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,7 +71,8 @@ def parse_args() -> argparse.Namespace:
             "  On first run you draw it by dragging across the video, and it\n"
             "  is saved to counting_line.json for every run after that. The\n"
             "  green arrow shows which way counts as an ENTRY - press 'f'\n"
-            "  during setup if it points the wrong way.\n"
+            "  during setup if it points the wrong way. '+' and '-' resize\n"
+            "  the dead zone, the orange band the counter ignores.\n"
         ),
     )
     parser.add_argument(
@@ -91,6 +99,13 @@ def parse_args() -> argparse.Namespace:
         help=f"inference size, multiple of 32 (default: {config.INFERENCE_SIZE})",
     )
     parser.add_argument(
+        "--track-point", default=None, metavar="{foot,head}",
+        help="which point on each person to count by, skipping the start-up "
+             "question: 'foot' (bottom of the box, the default - right for a "
+             "camera above head height) or 'head' (top of the box - steadier "
+             "where feet are hidden by crowds or furniture)",
+    )
+    parser.add_argument(
         "--no-trails", action="store_true",
         help="hide the motion trails in track and count modes",
     )
@@ -111,9 +126,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dead-zone", type=int, default=None, metavar="PX",
-        help=f"half-width in pixels of the ignore band around the line "
-             f"(default: {config.DEAD_ZONE_PX}). Raise it if a person standing "
-             f"on the line makes the counts climb",
+        help=f"half-width in pixels of the ignore band around the line, for "
+             f"this run only. Normally set by eye in the line setup screen "
+             f"with '+' and '-' and saved per camera; this overrides that "
+             f"without replacing it (default: the saved width, or "
+             f"{config.DEAD_ZONE_PX}). Raise it if a person standing on the "
+             f"line makes the counts climb",
     )
     return parser.parse_args()
 
@@ -130,8 +148,10 @@ def main() -> int:
     if args.conf is not None:
         config.DETECT_CONF_THRESHOLD = args.conf
         config.TRACK_CONF_THRESHOLD = args.conf
-    if args.dead_zone is not None:
-        config.DEAD_ZONE_PX = args.dead_zone
+    # --dead-zone is NOT written into config here, unlike the others: the
+    # width now lives on the counting line itself, saved per camera, and the
+    # flag has to override that rather than the default underneath it. It is
+    # passed down to resolve_line instead, alongside --line.
 
     # Ask which camera before anything heavy happens. --source or --no-prompt
     # skip the question; a cancelled prompt returns None and we simply stop.
@@ -140,6 +160,20 @@ def main() -> int:
         print("No camera chosen - nothing to do.")
         return 0
     print(f"Camera: {mask(source)}")
+
+    # Asked second, and only where it means something: view mode shows the
+    # camera and loads no model, so there is nothing to count by.
+    if args.mode != "view":
+        track_point = resolve_track_point(args.track_point,
+                                          ask=not args.no_prompt)
+        if track_point is None:
+            print("No tracking point chosen - nothing to do.")
+            return 0
+        # Same trick as the overrides above: every module reads
+        # config.TRACK_POINT at call time, so setting it here reaches all of
+        # them without threading the answer through the pipeline classes.
+        config.TRACK_POINT = track_point
+        print(f"Counting people by their {track_point}.")
 
     return run(
         mode=args.mode,
@@ -150,6 +184,7 @@ def main() -> int:
         # False forces sequential reading; None lets open_stream decide per
         # source, which is what you want almost always.
         threaded=False if args.no_threaded else None,
+        dead_zone=args.dead_zone,
     )
 
 

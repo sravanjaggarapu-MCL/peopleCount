@@ -52,6 +52,55 @@ def is_live_url(source: str) -> bool:
     return source.lower().startswith(LIVE_SCHEMES)
 
 
+def _port(parts) -> int | None:
+    """parts.port, or None when what follows the host is not a port number.
+
+    SplitResult.port RAISES rather than returning None if the text after the
+    host's ":" is not a number - which is exactly what a URL with its "@"
+    percent-encoded looks like. Code that only wants to print a URL should not
+    have to defend itself against that, so it goes through here.
+    """
+    try:
+        return parts.port
+    except ValueError:
+        return None
+
+
+def _bad_port(parts) -> bool:
+    """Does this URL carry something unusable where the port should be?"""
+    try:
+        parts.port
+    except ValueError:
+        return True
+    return False
+
+
+def repair_encoded_at(url: str) -> str:
+    """Put back the "@" that separates the credentials from the host.
+
+    Pasting a URL whose password was already percent-encoded very often
+    encodes the separator as well:
+
+        rtsp://admin:Mli%40Frs!2026%40172.18.3.213:554/video/live
+
+    There is now no "@" left at all, so every parser - ours and FFmpeg's -
+    reads "admin" as the host and the whole of
+    "Mli%40Frs!2026%40172.18.3.213:554" as the port. A host name can never
+    contain "%40", so the LAST one before the path is unambiguously the
+    separator: decode just that one and the URL means what was intended.
+
+    A URL that already has a literal "@" is left exactly as it is.
+    """
+    if not is_live_url(url):
+        return url
+    parts = urlsplit(url)
+    if "@" in parts.netloc or "%40" not in parts.netloc:
+        return url
+    user_info, _, host = parts.netloc.rpartition("%40")
+    return urlunsplit((parts.scheme, f"{user_info}@{host}",
+                       parts.path, parts.query, parts.fragment))
+
+
 def normalise_url(url: str) -> str:
     """Percent-encode the username and password inside an RTSP URL.
 
@@ -62,6 +111,7 @@ def normalise_url(url: str) -> str:
     safe="%" leaves an already-encoded password ("Admin%400192") untouched
     instead of double-encoding it into "Admin%2540192".
     """
+    url = repair_encoded_at(url)
     parts = urlsplit(url)
     if not parts.username and not parts.password:
         return url
@@ -72,8 +122,9 @@ def normalise_url(url: str) -> str:
     host = parts.hostname or ""
     if ":" in host:                      # bare IPv6 literal needs its brackets
         host = f"[{host}]"
-    if parts.port:
-        host = f"{host}:{parts.port}"
+    port = _port(parts)
+    if port:
+        host = f"{host}:{port}"
 
     credentials = user if password == "" else f"{user}:{password}"
     netloc = f"{credentials}@{host}"
@@ -106,9 +157,18 @@ def parse_source(text: str) -> str:
         raise ValueError("Nothing entered.")
 
     if is_live_url(text):
+        text = repair_encoded_at(text)
         parts = urlsplit(text)
         if not parts.hostname:
             raise ValueError(f"No host in that URL. Expected {FORMAT_HINT}")
+        if _bad_port(parts):
+            # Only reachable when the ":" is followed by something that is not
+            # a number AND repair_encoded_at found no "@" to put back - a
+            # genuinely mangled URL rather than the common encoded-"@" case.
+            raise ValueError(
+                f"\"{parts.netloc}\" has no readable port. If the password "
+                f"contains an \"@\", leave the separator before the host as a "
+                f"plain \"@\".\n  Expected {FORMAT_HINT}")
         if not parts.path and parts.scheme.startswith("rtsp"):
             raise ValueError(
                 "That URL has no stream path. Most cameras need one - for "
@@ -163,7 +223,26 @@ def load_cameras() -> list[str]:
     except (json.JSONDecodeError, OSError) as error:
         print(f"Ignoring unreadable {config.CAMERAS_FILE}: {error}")
         return []
-    return [url for url in data.get("cameras", []) if isinstance(url, str)]
+    cameras = []
+    for url in data.get("cameras", []):
+        if not isinstance(url, str):
+            continue
+        # The file is edited by hand as often as it is written by us, and one
+        # malformed line used to take the whole menu down with it. Repair what
+        # can be repaired, quietly drop what cannot, and keep the order.
+        url = repair_encoded_at(url)
+        if not _bad_port(urlsplit(url)):
+            # Normalising here as well as on the way out means two spellings
+            # of one camera ("Frs!2026" and "Frs%212026") collapse to a single
+            # menu entry instead of sitting next to each other twice.
+            url = normalise_url(url)
+        if _bad_port(urlsplit(url)):
+            print(f"Ignoring an unreadable camera in {config.CAMERAS_FILE}: "
+                  f"{url}")
+            continue
+        if url not in cameras:
+            cameras.append(url)
+    return cameras
 
 
 def remember_camera(source: str):
@@ -189,7 +268,11 @@ def remember_camera(source: str):
 
 def describe(url: str) -> str:
     """A short one-line label for the menu: host, port and stream path."""
+    if not is_live_url(url):
+        return url                       # a video file - the path IS the label
     parts = urlsplit(url)
+    if _bad_port(parts):
+        return url                       # unparseable - show it as it is
     host = parts.hostname or url
     port = f":{parts.port}" if parts.port else ""
     path = (parts.path or "") + (f"?{parts.query}" if parts.query else "")

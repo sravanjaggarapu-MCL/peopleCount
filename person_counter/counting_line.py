@@ -56,6 +56,23 @@ class CountingLine:
     # positive; -1 is the other one. Crossing INTO this side is an ENTRY.
     entry_side: int = 1
 
+    # Half-width of the ignore band around this line, in pixels, or None to
+    # use config.DEAD_ZONE_PX.
+    #
+    # It belongs to the LINE and not to the program because the right width is
+    # a property of this doorway on this camera: it depends on how big people
+    # are in the picture and how much their boxes breathe at that spot. A line
+    # drawn across a distant corridor and one across a doorway two metres from
+    # the lens need very different bands, and nothing about the rest of the
+    # configuration can tell them apart. Saved alongside the coordinates, so
+    # the operator sets it by eye once per camera - see line_setup.py.
+    dead_zone: int | None = None
+
+    @property
+    def effective_dead_zone(self) -> int:
+        """The band actually in force: this line's own, or the default."""
+        return config.DEAD_ZONE_PX if self.dead_zone is None else self.dead_zone
+
     @property
     def length(self) -> float:
         return math.hypot(self.x2 - self.x1, self.y2 - self.y1)
@@ -134,7 +151,7 @@ class CountingLine:
             return 0
 
         if dead_zone is None:
-            dead_zone = config.DEAD_ZONE_PX
+            dead_zone = self.effective_dead_zone
         distance = self.signed_distance(point)
         if abs(distance) < dead_zone:
             return 0
@@ -153,6 +170,11 @@ class CountingLine:
             "x1": self.x1, "y1": self.y1, "x2": self.x2, "y2": self.y2,
             "entry_side": self.entry_side,
         }
+        # Omitted entirely when it was never set, so a line that is happy with
+        # the default keeps following config.DEAD_ZONE_PX if that is retuned
+        # later, instead of silently freezing today's value into the file.
+        if self.dead_zone is not None:
+            data["dead_zone"] = self.dead_zone
         # Store the resolution it was drawn at. A line saved against a 640x480
         # sub-stream would sit in the wrong place on a 1920x1080 main stream,
         # and silently counting the wrong doorway is worse than asking again.
@@ -162,8 +184,10 @@ class CountingLine:
 
     @classmethod
     def from_dict(cls, data: dict) -> "CountingLine":
+        # .get for dead_zone keeps every line file written before it existed
+        # readable: absent means "use the default", which is what they meant.
         return cls(data["x1"], data["y1"], data["x2"], data["y2"],
-                   data.get("entry_side", 1))
+                   data.get("entry_side", 1), data.get("dead_zone"))
 
     def save(self, path: str | None = None, frame_size: tuple[int, int] | None = None):
         path = path or config.LINE_FILE
@@ -204,14 +228,15 @@ class CountingLine:
 
     def draw(self, frame, show_dead_zone: bool = True):
         """Draw the tripwire, its dead-zone band, and the entry arrow."""
-        if show_dead_zone and config.DEAD_ZONE_PX > 0:
+        dead_zone = self.effective_dead_zone
+        if show_dead_zone and dead_zone > 0:
             # The band is the line shifted along its normal in both directions.
             # Drawing it makes the tolerance visible: a person has to clear the
             # whole band before anything is counted, and seeing its width is the
             # easiest way to judge whether DEAD_ZONE_PX needs tuning.
             nx, ny = self.normal
-            offset_x = nx * config.DEAD_ZONE_PX
-            offset_y = ny * config.DEAD_ZONE_PX
+            offset_x = nx * dead_zone
+            offset_y = ny * dead_zone
             for sign in (1, -1):
                 cv2.line(
                     frame,

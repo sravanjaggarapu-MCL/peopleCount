@@ -1,0 +1,564 @@
+<!doctype html>
+<!--
+  index.html
+  ==========
+
+  The page you open on your laptop. It replaces the three things the desktop
+  program gets from a screen and a keyboard:
+
+    the window          an <img> pointed at /video. That URL never finishes
+                        sending - it is an endless sequence of JPEGs - so the
+                        browser just keeps repainting it. No JavaScript, no
+                        video player, no plugin.
+    the keypresses      buttons that POST to the small JSON API.
+    the line setup      click and drag across a still frame; the two points
+                        are converted from screen pixels to the camera's own
+                        pixels and posted to /api/line.
+
+  Written as one file with no framework and no CDN on purpose: the server it
+  runs on may have no route to the internet, and a page that fetches a
+  JavaScript library from somewhere else would simply show nothing.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Person counter</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --panel: #1d2026;
+    --panel-2: #262a32;
+    --line: #333842;
+    --text: #e8eaed;
+    --muted: #9aa2ae;
+    --green: #35c46a;
+    --amber: #f0a33a;
+    --red: #e4574c;
+    --blue: #4d8df6;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 12px 18px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .2px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .dot.running { background: var(--green); }
+  .dot.connecting, .dot.reconnecting, .dot.loading { background: var(--amber); }
+  .dot.stopped, .dot.error { background: var(--red); }
+  .src { color: var(--muted); font-size: 13px; word-break: break-all; }
+
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; padding: 16px; }
+  @media (max-width: 900px) { main { grid-template-columns: minmax(0, 1fr); } }
+
+  .stage { position: relative; background: #000; border-radius: 10px; overflow: hidden; line-height: 0; }
+  .stage img { width: 100%; height: auto; display: block; }
+  .stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .stage.editing canvas { cursor: crosshair; }
+
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 10px; }
+
+  .counts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; text-align: center; }
+  .counts div { background: var(--panel-2); border-radius: 8px; padding: 10px 4px; }
+  .counts b { display: block; font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .counts span { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+  .counts .in b { color: var(--green); }
+  .counts .out b { color: var(--amber); }
+
+  table.kv { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.kv td { padding: 3px 0; }
+  table.kv td:last-child { text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  button, select {
+    font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--line); border-radius: 7px; padding: 7px 11px; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: #4a5160; }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  button.danger { color: var(--red); }
+  select { width: 100%; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .row > * { flex: 1 1 auto; }
+
+  .seg { display: flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+  .seg button { flex: 1; border: 0; border-radius: 0; background: transparent; }
+  .seg button.on { background: var(--blue); color: #fff; }
+
+  input[type=range] { width: 100%; accent-color: var(--blue); }
+  .hint { color: var(--muted); font-size: 12px; margin: 8px 0 0; }
+  .events { font-size: 12px; color: var(--muted); max-height: 140px; overflow-y: auto; margin: 0; padding-left: 16px; }
+  .banner { padding: 10px 12px; border-radius: 8px; font-size: 13px; margin-bottom: 14px; display: none; }
+  .banner.show { display: block; }
+  .banner.warn { background: #3a2a18; color: #ffd9a0; border: 1px solid #5a4020; }
+  .banner.err  { background: #3a1e1c; color: #ffc3bd; border: 1px solid #5c2b27; }
+  .banner.ok   { background: #17351f; color: #b6f0c8; border: 1px solid #245c33; }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>Person counter</h1>
+  <span class="src" id="source">connecting…</span>
+</header>
+
+<main>
+  <section>
+    <div class="banner" id="banner"></div>
+    <div class="stage" id="stage">
+      <img id="view" alt="Live view from the camera">
+      <canvas id="overlay"></canvas>
+    </div>
+    <p class="hint" id="stagehint">
+      The green arrow points the way an <b>entry</b> goes. Red is the counting
+      line; the orange band beside it is ignored, so somebody standing on the
+      line cannot run the numbers up.
+    </p>
+  </section>
+
+  <aside>
+    <div class="card">
+      <h2>Counts</h2>
+      <div class="counts">
+        <div class="in"><b id="entry">0</b><span>Entries</span></div>
+        <div class="out"><b id="exit">0</b><span>Exits</span></div>
+        <div><b id="inside">0</b><span>Inside</span></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="reset">Reset counts</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Counting line</h2>
+      <div id="viewControls">
+        <div class="row">
+          <button id="editLine" class="primary">Draw / move the line</button>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button id="deleteLine" class="danger">Remove the line</button>
+        </div>
+        <p class="hint" id="lineState">No line on this camera yet.</p>
+      </div>
+
+      <div id="editControls" hidden>
+        <p class="hint" style="margin-top:0">
+          <b>Drag across the doorway</b> on the picture to place the line.
+        </p>
+        <div class="row">
+          <button id="flip">Flip entry direction</button>
+        </div>
+        <label class="hint" for="dz" style="display:block;margin-top:10px">
+          Ignored band: <span id="dzValue">12</span> px each side
+        </label>
+        <input type="range" id="dz" min="0" max="60" step="2" value="12">
+        <div class="row" style="margin-top:10px">
+          <button id="saveLine" class="primary" disabled>Save</button>
+          <button id="cancelLine">Cancel</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Count people by their</h2>
+      <div class="seg" id="trackPoint">
+        <button data-point="foot">Feet</button>
+        <button data-point="head">Head</button>
+      </div>
+      <p class="hint">
+        Feet suits a camera mounted above head height. Head is steadier where
+        the lower body is hidden — crowds, a counter or a desk across the
+        bottom of the picture.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>Camera</h2>
+      <select id="cameras"><option>loading…</option></select>
+      <div class="row" style="margin-top:8px">
+        <button id="switchCam">Switch to this camera</button>
+      </div>
+      <p class="hint">Cameras the server has used before.</p>
+    </div>
+
+    <div class="card">
+      <h2>Health</h2>
+      <table class="kv">
+        <tr><td>Status</td><td id="status">—</td></tr>
+        <tr><td>Processing</td><td id="fps">—</td></tr>
+        <tr><td>Behind live</td><td id="lag">—</td></tr>
+        <tr><td>Frames skipped</td><td id="drop">—</td></tr>
+        <tr><td>Picture size</td><td id="size">—</td></tr>
+        <tr><td>Connected for</td><td id="uptime">—</td></tr>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Recent crossings</h2>
+      <ul class="events" id="events"><li>none yet</li></ul>
+    </div>
+  </aside>
+</main>
+
+<script>
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const view = $("view"), canvas = $("overlay"), ctx = canvas.getContext("2d");
+const stage = $("stage");
+
+// Everything the page knows, in one object, so there is one place to look
+// when a value on screen is wrong.
+const state = {
+  frame: { w: 0, h: 0 },   // the camera's own pixels
+  line: null,              // the saved line, in camera pixels
+  editing: false,
+  draft: null,             // { x1, y1, x2, y2 } while dragging, camera pixels
+  entrySide: 1,
+  deadZone: 12,
+  trackPoint: "foot",
+};
+
+// --- the live picture ------------------------------------------------------
+// A cache-buster on the URL: without it a browser that has seen /video once
+// may reuse the finished response instead of opening a new stream.
+function showLive() { view.src = "/video?t=" + Date.now(); }
+function showStill() { view.src = "/snapshot.jpg?clean=1&t=" + Date.now(); }
+showLive();
+
+// --- banners ---------------------------------------------------------------
+let bannerTimer = null;
+function banner(text, kind = "warn", autoHideMs = 0) {
+  const el = $("banner");
+  el.textContent = text;
+  el.className = "banner show " + kind;
+  clearTimeout(bannerTimer);
+  if (autoHideMs) bannerTimer = setTimeout(() => el.className = "banner", autoHideMs);
+}
+function clearBanner() { clearTimeout(bannerTimer); $("banner").className = "banner"; }
+
+// --- coordinate conversion -------------------------------------------------
+// Clicks arrive in CSS pixels of a picture the browser has scaled to fit the
+// column. The server knows nothing about that scaling and expects the
+// camera's own pixels, so every click is divided by the ratio between the
+// two. Getting this wrong puts the line somewhere other than where it was
+// drawn, and the error grows with the zoom — which is why it is done in one
+// place and nowhere else.
+function toFrame(ev) {
+  const rect = view.getBoundingClientRect();
+  const scaleX = state.frame.w / rect.width;
+  const scaleY = state.frame.h / rect.height;
+  return {
+    x: Math.round((ev.clientX - rect.left) * scaleX),
+    y: Math.round((ev.clientY - rect.top) * scaleY),
+  };
+}
+function toScreen(p) {
+  const rect = view.getBoundingClientRect();
+  return { x: p.x * rect.width / state.frame.w, y: p.y * rect.height / state.frame.h };
+}
+
+// --- the overlay -----------------------------------------------------------
+// Only ever draws the line being edited. Once saved, the server draws it into
+// the video itself, so what you see is what the counter is actually using
+// rather than a second copy that could drift out of step with it.
+function resizeCanvas() {
+  const rect = view.getBoundingClientRect();
+  if (!rect.width) return;
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(rect.width * dpr);
+  canvas.height = Math.round(rect.height * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", () => { resizeCanvas(); drawOverlay(); });
+view.addEventListener("load", () => { resizeCanvas(); drawOverlay(); });
+
+function drawOverlay() {
+  const rect = view.getBoundingClientRect();
+  ctx.clearRect(0, 0, rect.width, rect.height);
+  if (!state.editing || !state.draft) return;
+
+  const a = toScreen({ x: state.draft.x1, y: state.draft.y1 });
+  const b = toScreen({ x: state.draft.x2, y: state.draft.y2 });
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  // The normal: (-dy, dx) normalised points at the side the maths calls
+  // positive. Same derivation as counting_line.py, so the arrow here and the
+  // arrow the server draws agree.
+  const nx = -dy / len, ny = dx / len;
+
+  const screenPerFrame = rect.width / state.frame.w;
+  const band = state.deadZone * screenPerFrame;
+
+  if (band > 0) {
+    ctx.strokeStyle = "rgba(255,165,0,.85)";
+    ctx.setLineDash([6, 4]);
+    ctx.lineWidth = 1;
+    for (const s of [1, -1]) {
+      ctx.beginPath();
+      ctx.moveTo(a.x + s * nx * band, a.y + s * ny * band);
+      ctx.lineTo(b.x + s * nx * band, b.y + s * ny * band);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+  }
+
+  ctx.strokeStyle = "#ff3b30";
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+
+  ctx.fillStyle = "#ff3b30";
+  for (const p of [a, b]) { ctx.beginPath(); ctx.arc(p.x, p.y, 5, 0, 7); ctx.fill(); }
+
+  // The entry arrow, from the middle of the line towards the inside.
+  const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+  const tx = mx + nx * state.entrySide * 46, ty = my + ny * state.entrySide * 46;
+  ctx.strokeStyle = ctx.fillStyle = "#35c46a";
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(mx, my); ctx.lineTo(tx, ty); ctx.stroke();
+  const ang = Math.atan2(ty - my, tx - mx);
+  ctx.beginPath();
+  ctx.moveTo(tx, ty);
+  ctx.lineTo(tx - 12 * Math.cos(ang - 0.4), ty - 12 * Math.sin(ang - 0.4));
+  ctx.lineTo(tx - 12 * Math.cos(ang + 0.4), ty - 12 * Math.sin(ang + 0.4));
+  ctx.fill();
+  ctx.font = "600 13px system-ui";
+  ctx.fillText("ENTRY", tx + 6, ty + 4);
+}
+
+// --- drawing the line ------------------------------------------------------
+let dragging = false;
+canvas.addEventListener("pointerdown", (ev) => {
+  if (!state.editing) return;
+  canvas.setPointerCapture(ev.pointerId);
+  const p = toFrame(ev);
+  state.draft = { x1: p.x, y1: p.y, x2: p.x, y2: p.y };
+  dragging = true;
+  drawOverlay();
+});
+canvas.addEventListener("pointermove", (ev) => {
+  if (!dragging) return;
+  const p = toFrame(ev);
+  state.draft.x2 = p.x; state.draft.y2 = p.y;
+  drawOverlay();
+  updateSaveButton();
+});
+canvas.addEventListener("pointerup", () => { dragging = false; updateSaveButton(); });
+
+function lineLength(d) {
+  return d ? Math.hypot(d.x2 - d.x1, d.y2 - d.y1) : 0;
+}
+function updateSaveButton() {
+  $("saveLine").disabled = lineLength(state.draft) < 20;
+}
+
+function startEditing() {
+  // Every click is converted using the camera's real dimensions, which arrive
+  // with the first /api/stats. Without them a drag would be recorded as zeros
+  // and the line saved into the top-left corner.
+  if (!state.frame.w) {
+    banner("Waiting for the first frame from the camera — try again in a moment.", "warn", 4000);
+    return;
+  }
+  state.editing = true;
+  stage.classList.add("editing");
+  $("viewControls").hidden = true;
+  $("editControls").hidden = false;
+  $("stagehint").textContent =
+    "Drag a line across the doorway. The picture is paused while you do.";
+  // A still frame, not the live stream: a line placed on moving video is
+  // placed on whichever frame happened to be showing when you let go.
+  showStill();
+  if (state.line) {
+    state.draft = { x1: state.line.x1, y1: state.line.y1, x2: state.line.x2, y2: state.line.y2 };
+    state.entrySide = state.line.entry_side;
+    state.deadZone = state.line.dead_zone ?? state.deadZone;
+  } else {
+    state.draft = null;
+  }
+  // A line drawn in the desktop program may carry a wider band than this
+  // slider's normal range. Stretch the slider to fit rather than clamping,
+  // which would quietly narrow the band the moment you pressed Save.
+  const slider = $("dz");
+  if (state.deadZone > Number(slider.max)) slider.max = state.deadZone;
+  slider.value = state.deadZone;
+  $("dzValue").textContent = state.deadZone;
+  updateSaveButton();
+  drawOverlay();
+}
+
+function stopEditing() {
+  state.editing = false;
+  state.draft = null;
+  stage.classList.remove("editing");
+  $("viewControls").hidden = false;
+  $("editControls").hidden = true;
+  $("stagehint").textContent =
+    "The green arrow points the way an entry goes. Red is the counting line; " +
+    "the orange band beside it is ignored.";
+  showLive();
+  drawOverlay();
+}
+
+$("editLine").onclick = startEditing;
+$("cancelLine").onclick = stopEditing;
+$("flip").onclick = () => { state.entrySide = -state.entrySide; drawOverlay(); };
+$("dz").oninput = (ev) => {
+  state.deadZone = Number(ev.target.value);
+  $("dzValue").textContent = state.deadZone;
+  drawOverlay();
+};
+
+// --- talking to the server -------------------------------------------------
+async function api(path, options) {
+  const response = await fetch(path, options);
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || ("HTTP " + response.status));
+  return body;
+}
+const postJSON = (path, data) => api(path, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(data || {}),
+});
+
+$("saveLine").onclick = async () => {
+  try {
+    await postJSON("/api/line", {
+      x1: state.draft.x1, y1: state.draft.y1, x2: state.draft.x2, y2: state.draft.y2,
+      entry_side: state.entrySide, dead_zone: state.deadZone,
+    });
+    banner("Line saved. Counting from zero on the new line.", "ok", 4000);
+    stopEditing();
+    refresh();
+  } catch (error) { banner(error.message, "err", 6000); }
+};
+
+$("deleteLine").onclick = async () => {
+  if (!confirm("Remove the counting line? The camera keeps running, but nothing will be counted until you draw a new one.")) return;
+  try {
+    await api("/api/line", { method: "DELETE" });
+    banner("Line removed.", "ok", 4000);
+    refresh();
+  } catch (error) { banner(error.message, "err", 6000); }
+};
+
+$("reset").onclick = async () => {
+  try { await postJSON("/api/reset"); refresh(); }
+  catch (error) { banner(error.message, "err", 6000); }
+};
+
+$("trackPoint").onclick = async (ev) => {
+  const button = ev.target.closest("button[data-point]");
+  if (!button) return;
+  try {
+    await postJSON("/api/track-point", { track_point: button.dataset.point });
+    refresh();
+  } catch (error) { banner(error.message, "err", 6000); }
+};
+
+$("switchCam").onclick = async () => {
+  const index = $("cameras").value;
+  if (index === "") return;
+  try {
+    await postJSON("/api/source", { index: Number(index) });
+    banner("Switching camera…", "warn", 5000);
+    setTimeout(() => { showLive(); loadCameras(); refresh(); }, 1500);
+  } catch (error) { banner(error.message, "err", 6000); }
+};
+
+async function loadCameras() {
+  try {
+    const { cameras } = await api("/api/cameras");
+    const select = $("cameras");
+    select.innerHTML = "";
+    if (!cameras.length) {
+      select.innerHTML = "<option value=''>none remembered yet</option>";
+      return;
+    }
+    for (const camera of cameras) {
+      const option = document.createElement("option");
+      option.value = camera.index;
+      option.textContent = camera.label + (camera.current ? "  (current)" : "");
+      if (camera.current) option.selected = true;
+      select.appendChild(option);
+    }
+  } catch { /* the health panel already shows the server is unreachable */ }
+}
+
+// --- the once-a-second refresh --------------------------------------------
+function human(seconds) {
+  if (seconds < 60) return seconds + "s";
+  if (seconds < 3600) return Math.floor(seconds / 60) + "m " + (seconds % 60) + "s";
+  return Math.floor(seconds / 3600) + "h " + Math.floor((seconds % 3600) / 60) + "m";
+}
+
+async function refresh() {
+  let stats;
+  try {
+    stats = await api("/api/stats");
+  } catch {
+    $("dot").className = "dot error";
+    $("status").textContent = "server unreachable";
+    return;
+  }
+
+  state.frame = { w: stats.frame_width, h: stats.frame_height };
+  state.line = stats.line;
+  state.trackPoint = stats.track_point;
+  if (!state.editing) state.deadZone = stats.dead_zone;
+
+  $("dot").className = "dot " + (stats.status === "loading model" ? "loading" : stats.status);
+  $("source").textContent = stats.source;
+  $("entry").textContent = stats.entry;
+  $("exit").textContent = stats.exit;
+  $("inside").textContent = stats.inside;
+  $("status").textContent = stats.status + (stats.mode === "track" ? " (no line)" : "");
+  $("fps").textContent = stats.fps ? stats.fps.toFixed(1) + " frames/s" : "—";
+  $("lag").textContent = stats.lag_ms ? stats.lag_ms + " ms" : "—";
+  $("drop").textContent = stats.dropped ? stats.dropped + " (" + stats.drop_rate + "%)" : "0";
+  $("size").textContent = stats.frame_width ? stats.frame_width + " × " + stats.frame_height : "—";
+  $("uptime").textContent = stats.connected_for ? human(stats.connected_for) : "—";
+
+  $("lineState").textContent = stats.line
+    ? `Line at (${stats.line.x1}, ${stats.line.y1}) → (${stats.line.x2}, ${stats.line.y2}), ignored band ${stats.dead_zone} px.`
+    : "No line on this camera yet — nothing is being counted.";
+  $("deleteLine").disabled = !stats.line;
+
+  for (const button of $("trackPoint").children) {
+    button.classList.toggle("on", button.dataset.point === stats.track_point);
+  }
+
+  const events = $("events");
+  events.innerHTML = "";
+  if (!stats.events.length) {
+    events.innerHTML = "<li>none yet</li>";
+  } else {
+    for (const event of stats.events) {
+      const item = document.createElement("li");
+      item.textContent = event;
+      events.appendChild(item);
+    }
+  }
+
+  if (stats.error) banner(stats.error, "err");
+  else if (stats.status === "running" && stats.mode === "track")
+    banner("No counting line on this camera yet — press “Draw / move the line”.", "warn");
+  else clearBanner();
+
+  if (!state.editing) drawOverlay();
+}
+
+refresh();
+loadCameras();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

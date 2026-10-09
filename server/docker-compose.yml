@@ -1,0 +1,51 @@
+# docker-compose.yml - the whole thing in one command.
+#
+#     cd server
+#     cp .env.example .env     # and edit it
+#     docker compose up -d     # build and start
+#     docker compose logs -f   # watch it
+#     docker compose down      # stop
+#
+# (On older installations the command is `docker-compose`, with a hyphen.)
+
+services:
+  person-counter:
+    build:
+      # The build needs person_counter/ and config.py, which live one level
+      # up, so the context is the project root and the Dockerfile path is
+      # given relative to it.
+      context: ..
+      dockerfile: server/Dockerfile
+    image: person-counter
+    container_name: person-counter
+
+    # host networking, deliberately. RTSP negotiates its own ports and some
+    # cameras announce an address that only makes sense on the real network;
+    # sharing the host's network side-steps every one of those problems. The
+    # web page is then simply on the host's own port 8000.
+    #
+    # It is Linux-only. On Docker Desktop (Mac/Windows) comment this out and
+    # uncomment the ports: block below.
+    network_mode: host
+
+    # ports:
+    #   - "8000:8000"
+
+    env_file:
+      - .env
+
+    volumes:
+      # The counting lines live outside the container, so rebuilding the image
+      # does not lose the line you drew. Same for the remembered camera list.
+      - ../lines:/app/lines
+      - ../cameras.json:/app/cameras.json
+
+    restart: unless-stopped
+
+    # The model is CPU-bound and will happily eat every core on the machine.
+    # Capping it leaves something for whatever else the server does. Remove
+    # the block if this box exists only to count people.
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"

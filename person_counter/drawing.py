@@ -58,7 +58,7 @@ def draw_label(frame, text: str, x: int, y: int, color):
 
 
 def draw_detection(frame, detection):
-    """Draw one detection: box, confidence label, and the foot point.
+    """Draw one detection: box, confidence label, and the counted point.
 
     Used by both modes. A detection with a track_id gets its own colour and an
     "ID n" prefix; one without gets plain green.
@@ -73,13 +73,16 @@ def draw_detection(frame, detection):
              else f"ID {detection.track_id}  {detection.confidence:.2f}")
     draw_label(frame, label, detection.x1, detection.y1, color)
 
-    # The dot where the person meets the floor - see Detection.foot_point for
-    # why this, and not the box centre, is the point that will be counted.
-    cv2.circle(frame, detection.foot_point, 4, color, -1)
+    # The dot marks the point that will actually be tested against the
+    # counting line - feet or head, whichever this run was started with.
+    # Drawing the real one rather than always the feet means a glance at the
+    # screen tells you which mode you are in, and a misread setting shows up
+    # immediately instead of as counts that are quietly wrong.
+    cv2.circle(frame, detection.reference_point, 4, color, -1)
 
 
 def draw_trail(frame, points, color):
-    """Join a person's remembered foot points into a fading polyline.
+    """Join a person's remembered positions into a fading polyline.
 
     Older segments are drawn thinner, so the trail reads as a direction of
     travel at a glance - which is precisely the question entry/exit counting

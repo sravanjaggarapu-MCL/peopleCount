@@ -5,3 +5,9 @@
 # install the CUDA build of torch first from https://pytorch.org, then this.
 ultralytics>=8.3.0
 opencv-python>=4.8.0
+
+# Intel's inference-only runtime. The project does not run the .pt weights
+# directly - export_openvino.py converts them to an .xml/.bin IR pair that
+# this package loads and executes, measured at 32 ms/frame against PyTorch's
+# 55 ms on the development machine.
+openvino>=2024.0.0

@@ -30,8 +30,10 @@ dist/
 config.py
 cameras.json
 
-# Downloaded model, local footage, and generated counting lines
+# Downloaded model, the OpenVINO IR built from it (regenerate with
+# `python export_openvino.py`), local footage, and generated counting lines
 yolov8n.pt
+yolov8n_openvino_model/
 sample.mp4
 counting_line.json*
 lines/*.json

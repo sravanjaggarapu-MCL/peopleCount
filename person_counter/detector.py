@@ -33,12 +33,47 @@ instead of killing it and reissuing a fresh ID - and every ID change like that
 would become a double count once we are counting crossings.
 """
 
+import contextlib
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
+import openvino as ov
+import torch
+import yaml
 from ultralytics import YOLO
 
 import config
+
+
+@contextlib.contextmanager
+def _pin_openvino_device(device: str):
+    """Force OpenVINO to compile for `device` instead of letting it choose.
+
+    ultralytics 8.3 hard-codes device_name="AUTO" when it compiles the IR, and
+    offers no argument to override it. AUTO is not a device: it starts the
+    model on the CPU, compiles for every other device it can find in the
+    background, then silently migrates to whichever it rates highest. On this
+    machine that is the integrated GPU - and an Intel UHD iGPU runs this
+    network at ~162 ms/frame against the CPU's ~29 ms. The migration happens
+    after a few seconds, so the symptom is video that starts at full speed and
+    then collapses, with nothing in the logs to say why.
+
+    Rather than edit site-packages or pin an ultralytics version, we swap the
+    one method for the duration of the load and put it straight back. The
+    patch is active only while OUR model compiles; anything else using
+    OpenVINO in this process is untouched.
+    """
+    original = ov.Core.compile_model
+
+    def compile_on_device(self, model, device_name=None, config=None, **kwargs):
+        return original(self, model, device_name=device, config=config, **kwargs)
+
+    ov.Core.compile_model = compile_on_device
+    try:
+        yield
+    finally:
+        ov.Core.compile_model = original
 
 
 @dataclass
@@ -70,6 +105,29 @@ class Detection:
         return (self.x1 + self.x2) // 2, self.y2
 
     @property
+    def head_point(self) -> tuple[int, int]:
+        """Top-centre of the box: the crown of the head.
+
+        The alternative to the feet, and the better one when the feet are not
+        reliably visible - in a crowd the lower body is occluded first, and a
+        bottom edge guessed from behind somebody else's shoulders wanders far
+        more than a top edge does. See config.TRACK_POINT.
+        """
+        return (self.x1 + self.x2) // 2, self.y1
+
+    @property
+    def reference_point(self) -> tuple[int, int]:
+        """The point this run counts, draws and trails people by.
+
+        Read from config at call time rather than captured once, so the
+        start-up prompt can settle it without anything here being rebuilt.
+        Everything that cares about WHERE a person is goes through this, so
+        the dot on screen and the point tested against the line can never
+        drift apart.
+        """
+        return self.head_point if config.TRACK_POINT == "head" else self.foot_point
+
+    @property
     def centroid(self) -> tuple[int, int]:
         """Middle of the box. Handy for drawing; not what we count on."""
         return (self.x1 + self.x2) // 2, (self.y1 + self.y2) // 2
@@ -82,22 +140,98 @@ class PersonDetector:
         self.model_path = model_path or config.MODEL_PATH
         self.inference_size = inference_size or config.INFERENCE_SIZE
 
-        # On the very first run this downloads the weights (~6 MB for nano) and
-        # caches them next to the project, so later runs work offline. The
-        # weights are pretrained on COCO - we are NOT training anything.
-        print(f"Loading {self.model_path} ...")
-        self.model = YOLO(self.model_path)
-        self._warm_up()
+        self._check_export()
+
+        # The weights are pretrained on COCO - we are NOT training anything.
+        # task= is passed explicitly because an OpenVINO directory, unlike a
+        # .pt checkpoint, carries no record of what the network was built for;
+        # without it ultralytics prints a warning and guesses.
+        print(f"Loading {config.MODEL_XML} ...")
+        with _pin_openvino_device(config.OPENVINO_DEVICE):
+            self.model = YOLO(self.model_path, task=config.MODEL_TASK)
+            # Compilation is lazy: ultralytics does not touch OpenVINO until
+            # the first inference, so the warm-up has to happen inside the
+            # patch or the device pin would miss it entirely.
+            self._warm_up()
+
+        # Deliberately last. Setting it any earlier accomplishes nothing:
+        # ultralytics calls select_device() while building its predictor,
+        # which resets torch's pool to the machine's core count, and the
+        # predictor is not built until the first inference above.
+        self._free_cores_for_openvino()
         print(f"Model ready (imgsz={self.inference_size}).")
+
+    @staticmethod
+    def _free_cores_for_openvino():
+        """Stop PyTorch's idle threads from starving the OpenVINO ones.
+
+        Torch is still imported - ultralytics uses it for NMS and the tracker -
+        and on import it sizes an intra-op thread pool to the whole machine.
+        Those threads do not sleep when idle, they spin-wait, so on a 4-core
+        laptop they sit on every core burning cycles while OpenVINO is trying
+        to use them. The two runtimes fight, and OpenVINO loses badly:
+
+            torch threads = 7  ->  194 ms per frame
+            torch threads = 4  ->  138 ms
+            torch threads = 2  ->   55 ms
+            torch threads = 1  ->   32 ms   (matches the model benchmarked alone)
+
+        Nothing is given up by shrinking the pool. The network itself runs
+        inside OpenVINO, which manages its own threads; what is left for torch
+        is NMS on a handful of boxes, measured at ~1.6 ms and unchanged here.
+        """
+        if config.TORCH_THREADS:
+            torch.set_num_threads(config.TORCH_THREADS)
+
+    def _check_export(self):
+        """Fail early, and with instructions, if the IR model is unusable.
+
+        Two things can be wrong, and OpenVINO reports neither of them in a way
+        that points at the fix:
+
+        Missing - the IR is generated rather than downloaded, so a fresh clone
+        has the .pt but not the .xml. Left alone, ultralytics would read the
+        absent directory as a model NAME and try to fetch it from the
+        internet, failing seconds later with an unrelated message.
+
+        Wrong size - IR is compiled for one fixed input shape. Feed it any
+        other and inference dies deep inside the runtime with "Failed to set
+        tensor" and a C++ source location, nothing about imgsz. metadata.yaml,
+        written beside the .xml at export time, records the shape it was built
+        for, so we can compare before the first frame instead.
+        """
+        if not Path(config.MODEL_XML).exists():
+            raise FileNotFoundError(
+                f"{config.MODEL_XML} not found.\n"
+                f"Build the OpenVINO model first:\n\n"
+                f"    python export_openvino.py\n"
+            )
+
+        meta = Path(config.OPENVINO_MODEL_DIR) / "metadata.yaml"
+        if not meta.exists():
+            return  # nothing to compare against; let ultralytics proceed
+
+        # Stored as [height, width]; our exports are square.
+        imgsz = yaml.safe_load(meta.read_text()).get("imgsz")
+        exported = imgsz[0] if isinstance(imgsz, (list, tuple)) else imgsz
+        if exported and exported != self.inference_size:
+            raise ValueError(
+                f"{config.MODEL_XML} was exported for imgsz={exported}, but "
+                f"this run wants imgsz={self.inference_size}.\n"
+                f"Either re-export at that size:\n\n"
+                f"    python export_openvino.py --imgsz {self.inference_size}\n\n"
+                f"or run at the size already exported (--imgsz {exported}).\n"
+            )
 
     def _warm_up(self):
         """Run one throwaway inference on a blank image.
 
-        PyTorch's first predict() call is dramatically slower than the rest -
-        it allocates buffers, picks algorithms and fills caches on the way
-        through. Measured here: ~2-3 s for the first call, ~0.09 s for every
-        one after it. Doing it now, before the window opens, keeps that stall
-        out of the display loop where it looks like the video has frozen.
+        The first predict() call is dramatically slower than the rest - it
+        allocates buffers, picks algorithms and fills caches on the way
+        through, and under OpenVINO it is also where the graph is compiled for
+        this particular CPU. Doing it now, before the window opens, keeps that
+        stall out of the display loop where it looks like the video has
+        frozen.
         """
         blank = np.zeros((self.inference_size, self.inference_size, 3), dtype=np.uint8)
         self.model.predict(blank, imgsz=self.inference_size, verbose=False)

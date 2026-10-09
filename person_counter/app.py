@@ -90,8 +90,8 @@ class TrackPipeline:
         self.detector = detector
         self.show_trails = show_trails
 
-        # Per-ID history of foot points. defaultdict creates the deque on first
-        # access, so there is no "if id not in dict" dance. maxlen makes it
+        # Per-ID history of the counted point. defaultdict creates the deque on
+        # first access, so there is no "if id not in dict" dance. maxlen makes it
         # self-trimming - appending to a full deque drops the oldest point - so
         # memory cannot creep up over hours of video.
         self.trails = defaultdict(lambda: deque(maxlen=config.TRAIL_LENGTH))
@@ -120,7 +120,9 @@ class TrackPipeline:
 
             live_ids.append(detection.track_id)
             self.seen_ids.add(detection.track_id)
-            self.trails[detection.track_id].append(detection.foot_point)
+            # The same point the counter tests, so the trail shows exactly
+            # what crossed the line rather than something near it.
+            self.trails[detection.track_id].append(detection.reference_point)
 
             if self.show_trails:
                 drawing.draw_trail(frame, self.trails[detection.track_id],
@@ -168,6 +170,12 @@ class CountPipeline(TrackPipeline):
             f"ENTRY: {self.counter.entry_count}",
             f"EXIT:  {self.counter.exit_count}",
             f"Inside: {self.counter.occupancy}    Tracking: {len(live_ids)}",
+            # Both of these are choices made before the window opened, and
+            # both change what gets counted. Showing them means a run that
+            # started with the wrong one is obvious from across the room
+            # rather than discovered in the totals afterwards.
+            f"Point: {config.TRACK_POINT}    "
+            f"Dead zone: {self.counter.line.effective_dead_zone} px",
         ]
 
     def draw_extras(self, frame):
@@ -186,7 +194,8 @@ class CountPipeline(TrackPipeline):
 # ---------------------------------------------------------------------------
 
 def _build_pipeline(mode: str, stream: VideoStream, show_trails: bool,
-                    redraw_line: bool, line_arg: str | None):
+                    redraw_line: bool, line_arg: str | None,
+                    dead_zone: int | None = None):
     """Create the pipeline for a mode, doing any setup that mode requires.
 
     Takes the open stream because count mode needs live frames to draw the
@@ -200,7 +209,8 @@ def _build_pipeline(mode: str, stream: VideoStream, show_trails: bool,
         # Ask for the line BEFORE loading the model: the setup screen only
         # needs video, and this way the operator is not left staring at a black
         # window while PyTorch wakes up.
-        line = resolve_line(stream, redraw=redraw_line, line_arg=line_arg)
+        line = resolve_line(stream, redraw=redraw_line, line_arg=line_arg,
+                            dead_zone=dead_zone)
         if line is None:
             return None          # operator cancelled
         detector = PersonDetector()
@@ -217,7 +227,7 @@ def _build_pipeline(mode: str, stream: VideoStream, show_trails: bool,
 
 def run(mode: str = "count", source: str | None = None, show_trails: bool = True,
         redraw_line: bool = False, line_arg: str | None = None,
-        threaded: bool | None = None) -> int:
+        threaded: bool | None = None, dead_zone: int | None = None) -> int:
     """Open the source, run the chosen pipeline, display until quit.
 
     Returns a process exit code: 0 for a clean finish, 1 if the source failed.
@@ -231,7 +241,8 @@ def run(mode: str = "count", source: str | None = None, show_trails: bool = True
         # out, including when the body raises - so a crash never leaves the
         # camera holding a dead stream slot open.
         with open_stream(source, threaded=threaded) as stream:
-            pipeline = _build_pipeline(mode, stream, show_trails, redraw_line, line_arg)
+            pipeline = _build_pipeline(mode, stream, show_trails, redraw_line,
+                                       line_arg, dead_zone)
             if pipeline is None:
                 return 0     # cancelled during line setup; not an error
 

@@ -1,0 +1,38 @@
+# Python packages for the Linux server.
+#
+# Install with the virtual environment active:
+#     pip install -r server/requirements.txt
+# (install.sh does this for you.)
+
+# --- the same three the desktop program uses -------------------------------
+# Keep these in step with the project's own requirements.txt. The server runs
+# the project's modules unchanged, so a version that works there works here.
+ultralytics>=8.3.0
+opencv-python>=4.8.0
+openvino>=2024.0.0
+
+# A note on opencv-python vs opencv-python-headless
+# -------------------------------------------------
+# The server draws no windows, so the headless build looks like the obvious
+# choice - it drops the GUI bits and the system libraries behind them. The
+# catch is that ultralytics declares a dependency on opencv-python by name, so
+# pip installs that as well, and the two packages install the SAME `cv2`
+# module over each other. Which one you end up with depends on the order pip
+# happened to use, and the failure (an ImportError about libGL, hours later,
+# on one machine but not another) is maddening to chase.
+#
+# So: the ordinary build, plus the two system libraries it wants. install.sh
+# and the Dockerfile both apt-get them:
+#
+#     libgl1  libglib2.0-0
+#
+# If disk space is genuinely tight, you can swap to headless afterwards with
+#     pip install --no-deps opencv-python-headless && pip uninstall -y opencv-python
+# but do it knowingly, not by default.
+
+# --- the web server --------------------------------------------------------
+# Flask routes the handful of URLs; waitress is the server that actually
+# listens. Flask's built-in one is a development tool - it says so on every
+# start - and is not meant to be left running for weeks.
+flask>=3.0.0
+waitress>=3.0.0

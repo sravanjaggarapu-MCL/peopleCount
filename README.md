@@ -98,7 +98,8 @@ python main.py --no-prompt           # skip the prompt, use config.py
 python main.py --source sample.mp4   # run against a recorded clip
 python main.py --imgsz 320           # faster, slightly less accurate
 python main.py --conf 0.3            # override the confidence threshold
-python main.py --dead-zone 20        # widen the ignore band at the line
+python main.py --track-point head    # count by the head instead of the feet
+python main.py --dead-zone 20        # widen the ignore band, this run only
 python main.py --line 0,300,640,300  # set the line without drawing it
 python main.py --no-trails           # hide the motion trails
 python main.py --help                # all options
@@ -106,6 +107,52 @@ python main.py --help                # all options
 
 In the window: **`q`** or **Esc** quits, **`t`** toggles motion trails,
 **`r`** resets the counts.
+
+## Choosing what gets counted — feet or head
+
+A person is a box, but a tripwire test needs a single point, and the two
+sensible candidates sit at opposite ends of the same box. They disagree by the
+height of a human — at a doorway, that is the difference between counting
+somebody as they arrive and counting them as they leave. So it is the second
+question at start-up:
+
+```
+====================================================================
+ WHICH POINT ON EACH PERSON SHOULD BE COUNTED?
+====================================================================
+   [1] FOOT  bottom of the box - where the person meets the floor  (default)
+         the usual choice: a camera above head height sees bodies lean
+         into the frame, so a head reaches the line too early
+
+   [2] HEAD  top of the box - the crown of the head
+         steadier where feet are hidden: crowds, near-overhead cameras,
+         or a desk or counter across the bottom of the picture
+
+   [Enter] keeps foot          [q] quit
+====================================================================
+```
+
+**Foot** is right for the usual bullet camera, angled down from above head
+height: bodies lean into that kind of frame, and the head is the end that
+leans, so it reaches the line while the person is still short of the doorway.
+
+**Head** wins wherever feet are not reliably visible. In a crowd the lower body
+is occluded first, and a box whose bottom edge is guessed from behind somebody
+else's shoulders jitters far more than its top edge does. Heads stay in view.
+
+Measured on a synthetic walk-through, a line at `y=300` and a 200 px-tall
+person moving down the frame:
+
+| `TRACK_POINT` | counts when the feet reach | one count, not two |
+|---|---|---|
+| `foot` | `y = 310` | yes |
+| `head` | `y = 510` | yes |
+
+Both register exactly one crossing — the choice moves *when*, not *whether*.
+The dot drawn on each person is whichever point is in use, and the count HUD
+names it, so a run started on the wrong one is visible rather than discovered
+later in the totals. `--track-point foot|head` answers the question in advance;
+`--no-prompt` takes the answer from `config.TRACK_POINT`.
 
 ## Drawing the counting line
 
@@ -116,11 +163,13 @@ so you can watch people walk through the scene while you place it:
 |---|---|
 | **click and drag** | draw the line |
 | **`f`** | flip which side counts as ENTRY — watch the green arrow |
+| **`+`** / **`-`** | widen or narrow the dead zone — the two orange lines |
 | **`r`** | start over |
 | **Enter** or **`c`** | confirm and begin counting |
 | **`q`** / **Esc** | cancel |
 
-It is saved and reused on every later run. Pass `--redraw-line` to replace it.
+The line **and its dead-zone width** are saved together and reused on every
+later run. Pass `--redraw-line` to replace them.
 
 **Each camera keeps its own line**, under `lines/`, named after its host and
 stream path:
@@ -156,6 +205,32 @@ pip install -r requirements.txt
 The model file (`yolov8n.pt`, ~6 MB) downloads by itself on first run and is
 cached in this folder, so later runs work offline.
 
+Then build the model the project actually runs on:
+
+```bash
+python export_openvino.py
+```
+
+This converts the PyTorch weights into **OpenVINO IR** — a `yolov8n.xml`
+holding the network topology and a `yolov8n.bin` holding the weights, written
+to `yolov8n_openvino_model/`. Nothing at run time loads the `.pt` any more;
+it is kept only as the source for this conversion.
+
+It is the same network and, checked frame by frame against the `.pt`, the same
+detections — but run by Intel's inference-only runtime, which compiles the
+graph for this CPU instead of interpreting it layer by layer through PyTorch.
+At the default `INFERENCE_SIZE` that is **32 ms per frame against 55 ms**.
+
+Two settings earn that margin, both in `config.py` and both documented there:
+`OPENVINO_DEVICE` (pinned to `CPU`, because ultralytics otherwise drifts onto
+the integrated GPU, which is ~5x slower here) and `TORCH_THREADS` (capped at
+1, because PyTorch's idle threads spin-wait and starve OpenVINO's). Undo
+either and the IR ends up slower than the `.pt` it replaced.
+
+Re-run the export after changing `INFERENCE_SIZE` — IR is compiled for one
+fixed input shape. The detector compares the two at start-up and refuses to
+run on a mismatch rather than letting OpenVINO fail obscurely mid-stream.
+
 ## Layout
 
 ```
@@ -164,7 +239,12 @@ config.py            every tunable setting: fallback camera, model, thresholds, 
 cameras.json         cameras used before, offered at the prompt (holds passwords)
 lines/               one drawn counting line per camera
 requirements.txt
-yolov8n.pt           downloaded automatically on first run
+export_openvino.py   one-off: converts yolov8n.pt into the OpenVINO .xml/.bin
+yolov8n.pt           downloaded automatically on first run; only the export reads it
+yolov8n_openvino_model/
+    yolov8n.xml      the network the project actually runs
+    yolov8n.bin      its weights
+    metadata.yaml    class names and the imgsz it was compiled for
 
 person_counter/
     __init__.py      sets FFmpeg's RTSP-over-TCP option (must run before cv2 loads)
@@ -174,6 +254,7 @@ person_counter/
     counting_line.py the tripwire: geometry, sides, dead zone, save/load
     line_setup.py    the click-and-drag screen for drawing the line
     source_prompt.py the "which camera?" prompt and the remembered camera list
+    track_point_prompt.py  the "feet or head?" prompt
     counter.py       entry/exit tallying — the crossing state machine
     app.py           the display loop, plus one pipeline class per mode
 
@@ -249,10 +330,10 @@ the two endpoints. Off either end, the answer is "no opinion".
 
 ### Plus two smaller guards
 
-- **Foot point, not centroid.** The dot at the bottom-centre of each box. On a
+- **A point at the edge of the box, never the centroid.** The feet by default,
+  the head if you chose it at start-up — see *Choosing what gets counted*. On a
   bullet camera mounted above head height the body leans into the frame, so the
-  centroid reaches the line while the person is still short of the doorway. The
-  feet are where the person actually is.
+  centroid reaches the line while the person is still short of the doorway.
 - **`MIN_TRACK_AGE_FRAMES`** — a track only a frame or two old may be a
   flickering false positive, or a real person whose ID was reissued mid-stride
   after an occlusion. Either way its first "crossing" is an artefact of being
@@ -263,21 +344,68 @@ the two endpoints. Off either end, the answer is "no opinion".
 
 Everything lives in `config.py`.
 
-**`DEAD_ZONE_PX`** (12) — half-width of the ignore band, in pixels, drawn on
-screen as two thin orange lines. Too narrow and counts climb while someone
-stands on the line; too wide and it swallows the doorway, missing people who
-genuinely cross near its edge. It is tuned for the 640×480 sub-stream — **scale
-it up for a higher-resolution stream**, since box jitter scales with box size.
+**The dead zone** — half-width of the ignore band, in pixels, drawn on screen
+as two thin orange lines. Too narrow and counts climb while someone stands on
+the line; too wide and it swallows the doorway, missing people who genuinely
+cross near its edge.
+
+You set it **where you draw the line**, on live video, with `+` and `-`:
+
+```
+Drag again to redraw  |  'f' flips the ENTRY arrow
+dead zone 18 px  ('+' / '-' to resize)
+Enter or 'c' to confirm  |  'r' clears  |  Esc cancels
+```
+
+The orange band resizes as you press, so you are judging the real width against
+the real doorway rather than guessing a number. Widen it until it comfortably
+covers the shuffling somebody does while standing on the threshold, and no
+wider. It is **saved with the line, per camera** — which is the right place for
+it, because the correct width depends on how large people are in *that*
+picture. A line across a distant corridor and one across a doorway two metres
+from the lens need very different bands, and nothing else in the configuration
+can tell them apart.
+
+Three places set it, narrowest scope first:
+
+| | Scope |
+|---|---|
+| `--dead-zone 20` | this run only — overrides the saved width without replacing it, for trying a number |
+| `+` / `-` in the setup screen | saved with that camera's line |
+| `config.DEAD_ZONE_PX` (12) | the starting width for any line never adjusted |
+
+A line file written before this existed simply has no saved width, so it keeps
+following `config.DEAD_ZONE_PX` — including if you retune that later.
+
+Measured on a loiterer wobbling ±8 px across the line for 40 frames, and on a
+genuine walk-through:
+
+| Dead zone | Phantom counts from the wobble | Real crossing still counted |
+|---|---|---|
+| 0 px | 18 entries + 18 exits | yes |
+| 4 px | 18 entries + 18 exits | yes |
+| 12 px | **0** | yes |
+| 20 px | **0** | yes |
+| 60 px | **0** | yes |
+
+The band has to be wider than the jitter to do anything at all — 4 px against
+an 8 px wobble changes nothing — and widening it well past that still does not
+cost a real crossing. `config.DEAD_ZONE_MAX_PX` (200) caps the adjustment; a
+band wider than that is a line drawn in the wrong place, not a dead zone set
+too narrow.
 
 **`INFERENCE_SIZE`** — the square each frame is resized to before the network
 sees it. Cost scales with roughly the square of this. Measured on this machine
-(CPU-only, `yolov8n`):
+(CPU-only, `yolov8n`), with the pre-OpenVINO `.pt` figures for comparison:
 
-| `INFERENCE_SIZE` | Inference speed |
-|---|---|
-| 320 | ~21 FPS |
-| 480 (default) | ~13 FPS |
-| 640 | ~9 FPS |
+| `INFERENCE_SIZE` | OpenVINO `.xml` | PyTorch `.pt` |
+|---|---|---|
+| 320 | 16 ms (~63 FPS) | ~21 FPS |
+| 480 (default) | 32 ms (~32 FPS) | ~13 FPS |
+| 640 | 56 ms (~18 FPS) | ~9 FPS |
+
+Changing this requires re-running `python export_openvino.py`, since the IR is
+compiled for one fixed input shape.
 
 **`DETECT_CONF_THRESHOLD`** (0.4) — how confident YOLO must be to draw a box.
 Lower catches partly hidden people but invents false boxes; higher misses

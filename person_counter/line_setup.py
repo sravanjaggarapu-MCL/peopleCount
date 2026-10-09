@@ -12,9 +12,17 @@ Controls
 --------
     click and drag   draw the line
     f                flip which side counts as ENTRY (watch the green arrow)
+    + / -            widen or narrow the dead zone (the two orange lines)
     r                start over
     Enter / c        confirm and begin counting
     q / Esc          cancel
+
+The dead zone is set here, on live video, for the same reason the line is: it
+is a distance in this camera's picture, and the only honest way to judge it is
+to look at it. The orange band is what the counter ignores - a person has to
+clear it completely on the far side before anything is counted - so widen it
+until it comfortably covers the shuffling someone does while standing on the
+threshold, and no wider. It is saved with the line, per camera.
 
 A note on mouse coordinates
 ---------------------------
@@ -90,8 +98,12 @@ def _draw_instructions(display, lines: list[str]):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
 
-def draw_line_interactively(stream, existing: CountingLine | None = None) -> CountingLine | None:
+def draw_line_interactively(stream, existing: CountingLine | None = None,
+                            dead_zone: int | None = None) -> CountingLine | None:
     """Show live video and let the operator drag out a line.
+
+    `dead_zone` is the band width to start from; None means take it from the
+    existing line, or from config.DEAD_ZONE_PX if there is no existing line.
 
     Returns the CountingLine, or None if they cancelled.
     """
@@ -107,11 +119,19 @@ def draw_line_interactively(stream, existing: CountingLine | None = None) -> Cou
         state.start = (existing.x1, existing.y1)
         state.end = (existing.x2, existing.y2)
 
+    # Held outside the line object because the line is rebuilt from scratch on
+    # every frame of a drag, and the operator's band width has to survive that.
+    if dead_zone is None:
+        dead_zone = (existing.effective_dead_zone if existing is not None
+                     else config.DEAD_ZONE_PX)
+    dead_zone = max(0, min(config.DEAD_ZONE_MAX_PX, int(dead_zone)))
+
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_AUTOSIZE)
     cv2.setMouseCallback(WINDOW_NAME, state.on_mouse)
 
     print("Draw the counting line: click and drag. "
-          "'f' flips entry direction, 'r' resets, Enter confirms, Esc cancels.")
+          "'f' flips entry direction, '+'/'-' resize the dead zone, "
+          "'r' resets, Enter confirms, Esc cancels.")
 
     try:
         for frame in stream:
@@ -135,23 +155,38 @@ def draw_line_interactively(stream, existing: CountingLine | None = None) -> Cou
                     # numerically meaningless, so we refuse to build one.
                     line = None
 
+            # Re-attached every frame rather than only on rebuild, so "+" and
+            # "-" also take effect on a line that was loaded and not redrawn.
+            if line is not None:
+                line.dead_zone = dead_zone
+
             # Draw the line onto the SCALED display. The line lives in frame
             # coordinates, so we scale a copy for drawing rather than storing
             # display coordinates anywhere.
             if line is not None:
+                # The band is a distance in frame pixels, so it scales with
+                # the picture. Miss this and the orange lines on the setup
+                # screen show a width the counter will not actually use.
+                # max(1, ...) keeps a narrow band visible instead of rounding
+                # it away to nothing on a scaled-down view.
+                scaled_dead_zone = (max(1, round(dead_zone * scale))
+                                    if dead_zone > 0 else 0)
                 scaled = CountingLine(
                     int(line.x1 * scale), int(line.y1 * scale),
                     int(line.x2 * scale), int(line.y2 * scale),
-                    line.entry_side,
+                    line.entry_side, scaled_dead_zone,
                 )
                 scaled.draw(display)
 
+            band = f"dead zone {dead_zone} px  ('+' / '-' to resize)"
             if line is None:
                 help_lines = ["Click and drag to draw the counting line",
+                              band,
                               "Esc cancels"]
             else:
                 help_lines = [
                     "Drag again to redraw  |  'f' flips the ENTRY arrow",
+                    band,
                     "Enter or 'c' to confirm  |  'r' clears  |  Esc cancels",
                 ]
             _draw_instructions(display, help_lines)
@@ -169,6 +204,14 @@ def draw_line_interactively(stream, existing: CountingLine | None = None) -> Cou
                 line = None
             if key == ord("f") and line is not None:
                 line.flip()
+            # "=" and "_" are the unshifted faces of the "+" and "-" keys, so
+            # both are accepted - otherwise widening the band needs Shift on
+            # most keyboards and narrowing it does not, which feels broken.
+            if key in (ord("+"), ord("=")):
+                dead_zone = min(config.DEAD_ZONE_MAX_PX,
+                                dead_zone + config.DEAD_ZONE_STEP_PX)
+            if key in (ord("-"), ord("_")):
+                dead_zone = max(0, dead_zone - config.DEAD_ZONE_STEP_PX)
 
             if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                 print("Line setup window closed.")
@@ -182,15 +225,20 @@ def draw_line_interactively(stream, existing: CountingLine | None = None) -> Cou
     return None
 
 
-def resolve_line(stream, redraw: bool = False,
-                 line_arg: str | None = None) -> CountingLine | None:
+def resolve_line(stream, redraw: bool = False, line_arg: str | None = None,
+                 dead_zone: int | None = None) -> CountingLine | None:
     """Get the counting line: from the flag, from disk, or by asking.
 
-    Order of preference:
+    Order of preference for the LINE:
       1. --line x1,y1,x2,y2 passed on the command line (never saved, since it
          is explicitly a one-off)
       2. the line saved for THIS camera, unless --redraw-line was given
       3. the interactive drawing screen
+
+    And for its DEAD ZONE, narrowest scope first:
+      1. --dead-zone N, which overrides whatever was saved, for this run only
+      2. the width saved with this camera's line, set in the setup screen
+      3. config.DEAD_ZONE_PX
 
     The line is stored per camera - see line_path_for - so switching cameras
     asks for a new line instead of reusing one drawn somewhere else.
@@ -201,7 +249,7 @@ def resolve_line(stream, redraw: bool = False,
         except ValueError:
             raise SystemExit(f"--line needs four integers: x1,y1,x2,y2 (got {line_arg!r})")
         print(f"Using line from --line: ({x1},{y1}) -> ({x2},{y2})")
-        return CountingLine(x1, y1, x2, y2)
+        return CountingLine(x1, y1, x2, y2, dead_zone=dead_zone)
 
     frame_size = (stream.width, stream.height)
     path = line_path_for(stream.source)
@@ -211,15 +259,24 @@ def resolve_line(stream, redraw: bool = False,
         if saved is None:
             saved = _load_legacy_line(frame_size, path)
         if saved is not None:
+            if dead_zone is not None:
+                # An explicit flag beats the saved width, but only for this
+                # run - we deliberately do not re-save, so --dead-zone stays a
+                # way to try a number without committing to it.
+                saved.dead_zone = dead_zone
             print(f"Loaded saved line from {path} "
-                  f"({saved.x1},{saved.y1}) -> ({saved.x2},{saved.y2}). "
+                  f"({saved.x1},{saved.y1}) -> ({saved.x2},{saved.y2}), "
+                  f"dead zone {saved.effective_dead_zone} px. "
                   "Use --redraw-line to change it.")
             return saved
         print(f"No line saved for this camera yet ({path}) - draw one.")
 
-    line = draw_line_interactively(stream)
+    line = draw_line_interactively(stream, dead_zone=dead_zone)
     if line is not None:
+        # Saved with its dead zone, so the width set by eye here is the one
+        # every later run on this camera starts from.
         line.save(path, frame_size=frame_size)
+        print(f"Dead zone set to {line.effective_dead_zone} px.")
     return line
 
 

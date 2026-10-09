@@ -109,12 +109,11 @@ class PersonCounter:
             state = self.states.setdefault(detection.track_id, TrackState())
             state.age += 1
 
-            # THE directional test. We use the foot point rather than the box
-            # centroid: on a bullet camera mounted above head height the body
-            # leans into the frame, so the centroid reaches the line while the
-            # person is still short of the doorway. The feet are where the
-            # person actually is.
-            side = self.line.side_of(detection.foot_point)
+            # THE directional test, against whichever point this run was
+            # started with - the feet by default, the head if the operator
+            # chose it. Never the box centroid: see config.TRACK_POINT for why
+            # the choice is the operator's and not a constant.
+            side = self.line.side_of(detection.reference_point)
 
             # 0 means inside the dead zone: no opinion, change nothing. This
             # single early return is what makes the whole scheme jitter-proof.

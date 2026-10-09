@@ -1,0 +1,43 @@
+# person-counter.service
+#
+# A template, for reading and for editing by hand. install_service.sh writes
+# this same file into /etc/systemd/system/ with the paths and username already
+# filled in, which is the easier route - use this one if you want to change
+# something it does not offer.
+#
+# To use it directly:
+#   1. replace /opt/person-counter with wherever the project actually is
+#   2. replace the User= line with the account that should run it
+#   3. sudo cp server/person-counter.service /etc/systemd/system/
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable --now person-counter
+
+[Unit]
+Description=Person counter - RTSP person counting with a web view
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/person-counter
+ExecStart=/opt/person-counter/.venv/bin/python /opt/person-counter/server/stream_server.py
+
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+# Settings normally come from server/.env. Anything set here wins over that
+# file, which is the way to keep a password out of the project folder: put it
+# in a root-owned file and point EnvironmentFile at it.
+# EnvironmentFile=/etc/person-counter.env
+# Environment=PORT=8000
+
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
